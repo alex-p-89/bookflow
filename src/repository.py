@@ -1,6 +1,7 @@
 from typing import List, Optional
 
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import desc, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,7 +64,10 @@ class BookFlowRepository:
 
     @staticmethod
     async def edit_book(
-        db: AsyncSession, book_id: int, new_data: BookUpdateSchema
+        db: AsyncSession,
+        redis: Optional[Redis],
+        book_id: int,
+        new_data: BookUpdateSchema,
     ) -> BookModel:
         query = select(BookModel).where(BookModel.book_id == book_id)
         db_book = (await db.scalars(query)).first()
@@ -74,20 +78,31 @@ class BookFlowRepository:
             setattr(db_book, field, value)
 
         await db.commit()
+        if redis is not None:
+            await BookFlowRepository._inc_top_n_books_key_version(redis)
+
         return db_book
 
     @staticmethod
     async def edit_book_directly(
-        db: AsyncSession, db_book: BookModel, new_data: BookUpdateSchema
+        db: AsyncSession,
+        redis: Optional[Redis],
+        db_book: BookModel,
+        new_data: BookUpdateSchema,
     ) -> BookModel:
         for field, value in new_data.model_dump(exclude_unset=True).items():
             setattr(db_book, field, value)
 
         await db.commit()
+        if redis is not None:
+            await BookFlowRepository._inc_top_n_books_key_version(redis)
+
         return db_book
 
     @staticmethod
-    async def delete_book(db: AsyncSession, book_id: int) -> BookModel:
+    async def delete_book(
+        db: AsyncSession, redis: Optional[Redis], book_id: int
+    ) -> BookModel:
         query = select(BookModel).where(BookModel.book_id == book_id)
         db_book = (await db.scalars(query)).first()
         if not db_book:
@@ -95,12 +110,20 @@ class BookFlowRepository:
 
         await db.delete(db_book)
         await db.commit()
+        if redis is not None:
+            await BookFlowRepository._inc_top_n_books_key_version(redis)
+
         return db_book
 
     @staticmethod
-    async def delete_book_directly(db: AsyncSession, db_book: BookModel) -> BookModel:
+    async def delete_book_directly(
+        db: AsyncSession, redis: Optional[Redis], db_book: BookModel
+    ) -> BookModel:
         await db.delete(db_book)
         await db.commit()
+        if redis is not None:
+            await BookFlowRepository._inc_top_n_books_key_version(redis)
+
         return db_book
 
     @staticmethod
@@ -221,22 +244,30 @@ class BookFlowRepository:
 
     @staticmethod
     async def _inc_top_n_books_key_version(redis: Redis) -> None:
-        await redis.incr("top_n_books_version", 1)
+        try:
+            await redis.incr("top_n_books_version", 1)
+        except RedisError:
+            pass
 
     @staticmethod
     async def get_top_n_books(
         db: AsyncSession, redis: Optional[Redis], n: int, descending_order: bool
     ) -> List[BookResponseSchema]:
-        if redis is not None:
-            cache_key_version = await BookFlowRepository._get_top_n_books_key_version(
-                redis
-            )
-            cache_key = f"top_n_books:v{cache_key_version}"
+        cache_key: Optional[str] = None
 
-            cached_data = await redis.get(cache_key)
-            if cached_data is not None:
-                books_from_cache = books_list_adapter.validate_json(cached_data)
-                return books_from_cache
+        if redis is not None:
+            try:
+                cache_key_version = (
+                    await BookFlowRepository._get_top_n_books_key_version(redis)
+                )
+                cache_key = (
+                    f"top_n_books:v{cache_key_version}:n={n}:desc={descending_order}"
+                )
+                cached_data = await redis.get(cache_key)
+                if cached_data is not None:
+                    return books_list_adapter.validate_json(cached_data)
+            except RedisError:
+                cache_key = None
 
         avg_rating = func.avg(UserToBookLinkModel.rating).label("avg_rating")
 
@@ -249,9 +280,13 @@ class BookFlowRepository:
         )
 
         books = (await db.scalars(query)).all()
-        if redis is not None:
-            books_schemas = books_list_adapter.validate_python(books)
-            books_to_cache = books_list_adapter.dump_json(books_schemas)
-            await redis.set(cache_key, books_to_cache, ex=10)
+
+        if redis is not None and cache_key is not None:
+            try:
+                books_schemas = books_list_adapter.validate_python(books)
+                books_to_cache = books_list_adapter.dump_json(books_schemas)
+                await redis.set(cache_key, books_to_cache, ex=10)
+            except RedisError:
+                pass
 
         return list(books)

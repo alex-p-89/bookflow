@@ -81,7 +81,6 @@ async def get_books(
 async def get_top_n_books(
     session: SessionDep,
     repository: RepositoryDep,
-    auth: AuthDep,
     redis: RedisDep,
     n: int = 3,
     descending_order: bool = True,
@@ -104,6 +103,7 @@ async def get_book(session: SessionDep, repository: RepositoryDep, book_id: int)
 async def edit_book(
     session: SessionDep,
     repository: RepositoryDep,
+    redis: RedisDep,
     current_user: CurrentUserDep,
     book_id: int,
     data: BookUpdateSchema,
@@ -113,7 +113,7 @@ async def edit_book(
     if db_book.owner_id != current_user_id:
         raise NotEnoughPermissionsException(current_user_id)
 
-    result = await repository.edit_book_directly(session, db_book, data)
+    result = await repository.edit_book_directly(session, redis, db_book, data)
     return result
 
 
@@ -122,6 +122,7 @@ async def edit_book(
 )
 async def delete_book(
     session: SessionDep,
+    redis: RedisDep,
     repository: RepositoryDep,
     current_user: CurrentUserDep,
     book_id: int,
@@ -131,7 +132,7 @@ async def delete_book(
     if db_book.owner_id != current_user_id:
         raise NotEnoughPermissionsException(current_user_id)
 
-    result = await repository.delete_book_directly(session, db_book)
+    result = await repository.delete_book_directly(session, redis, db_book)
     return result
 
 
